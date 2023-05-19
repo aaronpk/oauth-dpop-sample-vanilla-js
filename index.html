@@ -1,0 +1,424 @@
+<html>
+<title>OAuth DPoP in Vanilla JS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+
+
+
+
+<script>
+// Configure your application and authorization server details
+var config = {
+    client_id: "",
+    redirect_uri: "http://localhost:8080/",
+    authorization_endpoint: "https://dev-xxxxxx.okta.com/oauth2/default/v1/authorize",
+    token_endpoint: "https://dev-xxxxxx.okta.com/oauth2/default/v1/token",
+    requested_scopes: "openid"
+};
+</script>
+
+
+
+
+<div class="flex-center full-height">
+    <div class="content">
+        <a href="pkce.html" id="start">Click to Sign In</a>
+        <div id="token" class="hidden">
+            <h2>Access Token</h2>
+            <div id="access_token" class="code"></div>
+        </div>
+        <div id="error" class="hidden">
+            <h2>Error</h2>
+            <div id="error_details" class="code"></div>
+        </div>
+    </div>
+</div>  
+
+
+
+<script>
+
+//////////////////////////////////////////////////////////////////////
+// OAUTH REQUEST
+
+// Initiate the Authorization Code flow when the link is clicked
+document.getElementById("start").addEventListener("click", async function(e){
+    e.preventDefault();
+
+    
+    // Create and store a random "state" value
+    var state = generateRandomString();
+    localStorage.setItem("pkce_state", state);
+
+
+
+    // Create and store a new PKCE code_verifier (the plaintext random secret)
+    var code_verifier = generateRandomString();
+    localStorage.setItem("pkce_code_verifier", code_verifier);
+
+
+
+    // Hash and base64-urlencode the secret to use as the challenge
+    var code_challenge = await pkceChallengeFromVerifier(code_verifier);
+
+    // Build the authorization URL
+    var url = config.authorization_endpoint 
+        + "?response_type=code"
+        + "&client_id="+encodeURIComponent(config.client_id)
+        + "&state="+encodeURIComponent(state)
+        + "&scope="+encodeURIComponent(config.requested_scopes)
+        + "&redirect_uri="+encodeURIComponent(config.redirect_uri)
+        + "&code_challenge="+encodeURIComponent(code_challenge)
+        + "&code_challenge_method=S256"
+        ;
+
+
+    // Redirect to the authorization server
+    window.location = url;
+});
+
+
+//////////////////////////////////////////////////////////////////////
+// OAUTH REDIRECT HANDLING
+
+
+// Handle the redirect back from the authorization server and
+// get an access token from the token endpoint
+
+var q = parseQueryString(window.location.search.substring(1));
+
+// Check if the server returned an error string
+if(q.error) {
+    alert("Error returned from authorization server: "+q.error);
+    document.getElementById("error_details").innerText = q.error+"\n\n"+q.error_description;
+    document.getElementById("error").classList = "";
+}
+
+
+
+// If the server returned an authorization code, attempt to exchange it for an access token
+if(q.code) {
+
+
+    // Verify state matches what we set at the beginning
+    if(localStorage.getItem("pkce_state") != q.state) {
+        alert("Invalid state");
+    } else {
+
+        // Retrieve the PKCE code verifier from localstorage
+        const code_verifier = localStorage.getItem("pkce_code_verifier");
+
+        // The success handler will be called on an HTTP 200 response
+        var successResponse = function(response, body) {
+
+            // Initialize your application now that you have an access token.
+            // Here we just display it in the browser.
+            document.getElementById("access_token").innerText = body.access_token;
+            document.getElementById("start").classList = "hidden";
+            document.getElementById("token").classList = "";
+
+            // Replace the history entry to remove the auth code from the browser address bar
+            window.history.replaceState({}, null, "/index.html");
+
+            document.getElementById("error_details").innerText = '';
+            document.getElementById("error").classList = "hidden";
+
+        };
+
+        var errorResponse = function(response, error) {
+            // The first token request will fail and include a nonce in the header
+            const nonce = response.headers.get('dpop-nonce');
+
+            if(nonce && error.error == 'use_dpop_nonce') {
+                // Try the request again
+                sendPostRequest(config.token_endpoint, {
+                    grant_type: "authorization_code",
+                    code: q.code,
+                    client_id: config.client_id,
+                    redirect_uri: config.redirect_uri,
+                    code_verifier: code_verifier,
+                }, successResponse, errorResponse, nonce);
+            }
+
+            // This could be an error response from the OAuth server, or an error because the 
+            // request failed such as if the OAuth server doesn't allow CORS requests
+            document.getElementById("error_details").innerText = error.error+"\n\n"+error.error_description;
+            document.getElementById("error").classList = "";
+        }
+
+
+        // Exchange the authorization code for an access token
+        sendPostRequest(config.token_endpoint, {
+            grant_type: "authorization_code",
+            code: q.code,
+            client_id: config.client_id,
+            redirect_uri: config.redirect_uri,
+            code_verifier: code_verifier,
+        }, successResponse, errorResponse);
+    }
+
+
+
+
+    // Clean these up since we don't need them anymore
+    localStorage.removeItem("pkce_state");
+    localStorage.removeItem("pkce_code_verifier");
+}
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////
+// DPOP FUNCTIONS
+
+
+// Return a DPoP JWT for an HTTP request
+async function DPoP(method, url, nonce, access_token) {
+    var key = await loadKey();
+
+    var claims = {
+        htm: method,
+        htu: url,
+        iat: Math.floor(Date.now()/1000),
+        jti: generateRandomString(),
+    };
+
+    if(nonce) {
+        claims.nonce = nonce;
+    }
+
+    if(access_token) {
+        claims.ath = base64urlencode(await crypto.subtle.digest('SHA-256', strToBuf(access_token)));
+    }
+
+    return jwt({
+        alg: 'RS256',
+        typ: 'dpop+jwt',
+        jwk: await publicJwk(key.publicKey),
+    }, claims,
+    key.privateKey);
+}
+
+
+// Make a POST request and parse the response as JSON
+async function sendPostRequest(url, params, success, error, nonce=null) {
+    var dPoPProof = await DPoP('POST', url, nonce);
+    console.log(dPoPProof);
+
+    const formData = new FormData();
+    for( var key in params ) {
+        formData.append(key, params[key]);
+    }
+
+    const headers = new Headers({
+        'DPoP': dPoPProof,
+    });
+
+    const response = await fetch(url, {
+        method: 'POST',
+        cache: 'no-cache',
+        headers: headers,
+        body: new URLSearchParams(formData),
+    });
+
+    const body = await response.json();
+
+    if(response.status == 200) {
+        success(response, body);
+    } else {
+        error(response, body);
+    }
+}
+
+
+
+// Generate a new non-exportable private key
+async function generateKeyPair() {
+    algorithm = {
+        name: 'RSASSA-PKCS1-v1_5',
+        hash: 'SHA-256',
+        modulusLength: 2048,
+        publicExponent: new Uint8Array([0x01, 0x00, 0x01]),
+    };
+
+    // The "false" here makes it non-exportable
+    // https://caniuse.com/mdn-api_subtlecrypto_generatekey
+    return crypto.subtle.generateKey(algorithm, false, ['sign', 'verify']);
+}
+
+// Wrapper function for IndexedDB to open the database and run an operation
+// https://caniuse.com/indexeddb
+function callOnStore(fn_) {
+    console.log("Opening Database");
+    var open = window.indexedDB.open("KeyDatabase", 1);
+    open.onupgradeneeded = function() {
+        console.log("Upgrading database");
+        var db = open.result;
+        var store = db.createObjectStore("ObjectStore", {keyPath: "id"});
+    };
+    open.onsuccess = function() {
+        console.log("Success opening database");
+        // Start a new transaction
+        var db = open.result;
+        var tx = db.transaction("ObjectStore", "readwrite");
+        var store = tx.objectStore("ObjectStore");
+
+        fn_(store);
+
+        // Close the db when the transaction is done
+        tx.oncomplete = function() {
+            // console.log("Transaction complete");
+            db.close();
+        };
+    }
+    open.onerror = function() {
+        console.log("Error opening database");
+    }
+}
+
+// Generate a new private key and store in IndexedDB
+async function generateAndSaveKey() {
+    var key = await generateKeyPair();
+    console.log("Generated key", key);
+
+    callOnStore(function(store){
+
+        store.put({id: 1, key: key});
+        console.log("Saved Key");
+
+    });
+}
+
+// Retrieve the handle to the private key from IndexedDB
+function loadKey() {
+    return new Promise(key => {
+        callOnStore(function(store){
+            console.log("Attempting to load key");
+            var getData = store.get(1);
+            getData.onsuccess = async function() {
+                // console.log("Key loaded");
+                console.log(getData.result);
+                key(getData.result.key);
+            }
+        });
+    });
+}
+
+// Build a JWT in Vanilla JS
+// https://caniuse.com/mdn-api_subtlecrypto_sign
+async function jwt(header, claims, key) {
+    const input = `${base64urlencode(strToBuf(JSON.stringify(header)))}.${base64urlencode(strToBuf(JSON.stringify(claims)))}`;
+    const signature = base64urlencode(await crypto.subtle.sign({ name: key.algorithm.name }, key, strToBuf(input)));
+    return `${input}.${signature}`;
+}
+
+// Create JWK-formatted JSON of the public key
+async function publicJwk(key) {
+    // https://caniuse.com/mdn-api_subtlecrypto_exportkey
+    const { kty, e, n, x, y, crv } = await crypto.subtle.exportKey('jwk', key);
+    return { kty, crv, e, n, x, y};
+}
+
+
+
+
+//////////////////////////////////////////////////////////////////////
+// GENERAL HELPER FUNCTIONS
+
+
+
+// Parse a query string into an object
+function parseQueryString(string) {
+    if(string == "") { return {}; }
+    var segments = string.split("&").map(s => s.split("=") );
+    var queryString = {};
+    segments.forEach(s => queryString[s[0]] = s[1]);
+    return queryString;
+}
+
+
+// Generate a secure random string using the browser crypto functions
+function generateRandomString() {
+    var array = new Uint32Array(28);
+    window.crypto.getRandomValues(array);
+    return Array.from(array, dec => ('0' + dec.toString(16)).substr(-2)).join('');
+}
+
+
+
+// Calculate the SHA256 hash of the input text. 
+// Returns a promise that resolves to an ArrayBuffer
+function sha256(plain) {
+    return window.crypto.subtle.digest('SHA-256', strToBuf(plain));
+}
+
+
+// Base64-urlencode the input string
+function base64urlencode(str) {
+    // Convert the ArrayBuffer to string using Uint8 array to conver to what btoa accepts.
+    // btoa accepts chars only within ascii 0-255 and base64 encodes them.
+    // Then convert the base64 encoded to base64url encoded
+    //   (replace + with -, replace / with _, trim trailing =)
+    return btoa(String.fromCharCode.apply(null, new Uint8Array(str)))
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+
+// Return the base64-urlencoded sha256 hash for the PKCE challenge
+async function pkceChallengeFromVerifier(v) {
+    hashed = await sha256(v);
+    return base64urlencode(hashed);
+}
+
+
+function strToBuf(string) {
+    const encoder = new TextEncoder();
+    return encoder.encode(string);
+}
+
+
+
+
+
+</script>
+
+<style>
+body {
+  padding: 0;
+  margin: 0;
+  min-height: 100vh;
+  font-family: arial, sans-serif;
+}
+@media(max-width: 400px) {
+  body {
+    padding: 10px;
+  }
+}
+.full-height {
+  min-height: 100vh;
+}
+.flex-center {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+}
+.content {
+  max-width: 400px;
+}
+h2 {
+  text-align: center;
+}
+.code {
+  font-family: "Courier New", "Courier", monospace;
+  width: 100%;
+  padding: 4px;
+  border: 1px #ccc solid;
+  border-radius: 4px;
+  word-break: break-all;
+}
+.hidden {
+  display: none;
+}
+</style>
+
+</html>
